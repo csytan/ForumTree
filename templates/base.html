@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    {% block title %}
+        <title>forumtree | a visualization of proggit</title>
+    {% end %}
+    <link type="text/css" href="/static/style.css" rel="stylesheet">
+    {% block style %}{% end %}
+    <script type="text/javascript" src="http://ajax.googleapis.com/ajax/libs/jquery/1.4.2/jquery.min.js"></script>
+    {% block script %}{% end %}
+</head>
+
+<body>
+    <a href="http://github.com/csytan/forumtree"><img style="position: absolute; top: 0; right: 0; border: 0;" src="http://s3.amazonaws.com/github/ribbons/forkme_right_gray_6d6d6d.png" alt="Fork me on GitHub"></a>
+    <div id="header">
+        <a href="/" id="logo">forumtree</a>
+        <br>
+        a visualization of <a href="http://www.reddit.com/r/programming/">proggit</a>
+    </div>
+    <div id="content">
+        {% block content %}{% end %}
+    </div>
+    <div id="footer">
+        <script type="text/javascript">
+        var gaJsHost = (("https:" == document.location.protocol) ? "https://ssl." : "http://www.");
+        document.write(unescape("%3Cscript src='" + gaJsHost + "google-analytics.com/ga.js' type='text/javascript'%3E%3C/script%3E"));
+        </script>
+        <script type="text/javascript">
+        try {
+        var pageTracker = _gat._getTracker("UA-3228291-1");
+        pageTracker._trackPageview();
+        } catch(err) {}</script>
+    </div>
+</body>
+
+</html>
