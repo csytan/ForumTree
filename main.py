@@ -1,37 +1,28 @@
-# Python imports
 import re
+import logging
+import urllib
 import os
 import wsgiref.handlers
 
-# Appengine imports
 from google.appengine.api import memcache
+import simplejson as json
 
-# Tornado imports
 import tornado.wsgi
 import tornado.web
 
-# Local imports
-import reddit
-import markdown2
 
-
-def markdown(value):
-    # real line breaks
-    value = re.sub(r'(\S ?)(\r\n|\r|\n)', r'\1  \n', value)
-    # automatic hyperlinks
-    value = re.sub(r'(^|\s)(http:\/\/\S+)', r'\1<\2>', value)
-    html = markdown2.markdown(value, safe_mode='escape')
-    return html.replace('<a href=', '<a rel="nofollow" href=')
-    
 
 class Topics(tornado.web.RequestHandler):
     def get(self):
         topics = memcache.get('topics')
         if topics is None:
             try:
-                topics = reddit.topics()
-            except:
+                response = urllib.urlopen('http://api.ihackernews.com/page').read()
+                data = json.loads(response)
+            except Exception, e:
+                logging.error(e)
                 return self.render('error.html')
+            topics = data['items']
             memcache.add('topics', topics, 10)
         self.render('topics.html', topics=topics)
 
@@ -41,11 +32,36 @@ class Topic(tornado.web.RequestHandler):
         topic = memcache.get('topic:' + id)
         if topic is None:
             try:
-                topic = reddit.topic(id)
-            except:
+                topic = self.fetch_topic(id)
+            except Exception, e:
+                logging.error(e)
                 return self.render('error.html')
             memcache.add('topic:' + id, topic, 10)
-        self.render('topic.html', markdown=markdown, **topic)
+        self.render('topic.html', topic=topic)
+        
+    @staticmethod
+    def fetch_topic(id):
+        response = urllib.urlopen('http://api.ihackernews.com/post/' + id).read()
+        topic = json.loads(response)
+        topic['graph'] = {}
+        topic['all_comments'] = []
+        
+        def generate_graph(comments):
+            """Generates an id mapping between comments and their children.
+            This graph is used for javascript layout.
+                {
+                    "comment_id": ["child_id", "child_id2"],
+                    "comment_id2": ...
+                }
+            """
+            for comment in comments:
+                topic['all_comments'].append(comment)
+                parent = topic['graph'].setdefault(comment['parentId'], [])
+                parent.append(comment['id'])
+                generate_graph(comment['children'])
+        
+        generate_graph(topic['comments'])
+        return topic
 
 
 settings = {

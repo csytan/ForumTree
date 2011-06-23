@@ -16,56 +16,71 @@
 
 """WSGI support for the Tornado web framework.
 
-We export WSGIApplication, which is very similar to web.Application, except
-no asynchronous methods are supported (since WSGI does not support
-non-blocking requests properly). If you call self.flush() or other
-asynchronous methods in your request handlers running in a WSGIApplication,
-we throw an exception.
+WSGI is the Python standard for web servers, and allows for interoperability
+between Tornado and other Python web frameworks and servers.  This module
+provides WSGI support in two ways:
 
-Example usage:
-
-    import tornado.web
-    import tornado.wsgi
-    import wsgiref.simple_server
-
-    class MainHandler(tornado.web.RequestHandler):
-        def get(self):
-            self.write("Hello, world")
-
-    if __name__ == "__main__":
-        application = tornado.wsgi.WSGIApplication([
-            (r"/", MainHandler),
-        ])
-        server = wsgiref.simple_server.make_server('', 8888, application)
-        server.serve_forever()
-
-See the 'appengine' demo for an example of using this module to run
-a Tornado app on Google AppEngine.
-
-Since no asynchronous methods are available for WSGI applications, the
-httpclient and auth modules are both not available for WSGI applications.
-
-We also export WSGIContainer, which lets you run other WSGI-compatible
-frameworks on the Tornado HTTP server and I/O loop. See WSGIContainer for
-details and documentation.
+* `WSGIApplication` is a version of `tornado.web.Application` that can run 
+  inside a WSGI server.  This is useful for running a Tornado app on another
+  HTTP server, such as Google App Engine.  See the `WSGIApplication` class
+  documentation for limitations that apply.
+* `WSGIContainer` lets you run other WSGI applications and frameworks on the
+  Tornado HTTP server.  For example, with this class you can mix Django
+  and Tornado handlers in a single server.
 """
 
 import cgi
-import cStringIO
-import escape
 import httplib
 import logging
 import sys
 import time
+import tornado
 import urllib
-import web
 
+from tornado import escape
+from tornado import httputil
+from tornado import web
+from tornado.escape import native_str, utf8
+from tornado.util import b
+
+try:
+    from io import BytesIO  # python 3
+except ImportError:
+    from cStringIO import StringIO as BytesIO  # python 2
 
 class WSGIApplication(web.Application):
-    """A WSGI-equivalent of web.Application.
+    """A WSGI equivalent of `tornado.web.Application`.
 
+    WSGIApplication is very similar to web.Application, except no
+    asynchronous methods are supported (since WSGI does not support
+    non-blocking requests properly). If you call self.flush() or other
+    asynchronous methods in your request handlers running in a
+    WSGIApplication, we throw an exception.
+
+    Example usage::
+
+        import tornado.web
+        import tornado.wsgi
+        import wsgiref.simple_server
+
+        class MainHandler(tornado.web.RequestHandler):
+            def get(self):
+                self.write("Hello, world")
+
+        if __name__ == "__main__":
+            application = tornado.wsgi.WSGIApplication([
+                (r"/", MainHandler),
+            ])
+            server = wsgiref.simple_server.make_server('', 8888, application)
+            server.serve_forever()
+
+    See the 'appengine' demo for an example of using this module to run
+    a Tornado app on Google AppEngine.
+
+    Since no asynchronous methods are available for WSGI applications, the
+    httpclient and auth modules are both not available for WSGI applications.
     We support the same interface, but handlers running in a WSGIApplication
-    do not support flush() or asynchronous methods.
+    do not support flush() or asynchronous methods. 
     """
     def __init__(self, handlers=None, default_host="", **settings):
         web.Application.__init__(self, handlers, default_host, transforms=[],
@@ -80,12 +95,13 @@ class WSGIApplication(web.Application):
         for cookie_dict in getattr(handler, "_new_cookies", []):
             for cookie in cookie_dict.values():
                 headers.append(("Set-Cookie", cookie.OutputString(None)))
-        start_response(status, headers)
+        start_response(status,
+                       [(native_str(k), native_str(v)) for (k,v) in headers])
         return handler._write_buffer
 
 
 class HTTPRequest(object):
-    """Mimics httpserver.HTTPRequest for WSGI applications."""
+    """Mimics `tornado.httpserver.HTTPRequest` for WSGI applications."""
     def __init__(self, environ):
         """Parses the given WSGI environ to construct the request."""
         self.method = environ["REQUEST_METHOD"]
@@ -101,16 +117,17 @@ class HTTPRequest(object):
                 values = [v for v in values if v]
                 if values: self.arguments[name] = values
         self.version = "HTTP/1.1"
-        self.headers = HTTPHeaders()
+        self.headers = httputil.HTTPHeaders()
         if environ.get("CONTENT_TYPE"):
             self.headers["Content-Type"] = environ["CONTENT_TYPE"]
         if environ.get("CONTENT_LENGTH"):
-            self.headers["Content-Length"] = int(environ["CONTENT_LENGTH"])
+            self.headers["Content-Length"] = environ["CONTENT_LENGTH"]
         for key in environ:
             if key.startswith("HTTP_"):
                 self.headers[key[5:].replace("_", "-")] = environ[key]
         if self.headers.get("Content-Length"):
-            self.body = environ["wsgi.input"].read()
+            self.body = environ["wsgi.input"].read(
+                int(self.headers["Content-Length"]))
         else:
             self.body = ""
         self.protocol = environ["wsgi.url_scheme"]
@@ -127,8 +144,13 @@ class HTTPRequest(object):
             for name, values in cgi.parse_qs(self.body).iteritems():
                 self.arguments.setdefault(name, []).extend(values)
         elif content_type.startswith("multipart/form-data"):
-            boundary = content_type[30:]
-            if boundary: self._parse_mime_body(boundary)
+            if 'boundary=' in content_type:
+                boundary = content_type.split('boundary=',1)[1]
+                if boundary:
+                    httputil.parse_multipart_form_data(
+                        utf8(boundary), self.body, self.arguments, self.files)
+            else:
+                logging.warning("Invalid multipart/form-data")
 
         self._start_time = time.time()
         self._finish_time = None
@@ -148,47 +170,12 @@ class HTTPRequest(object):
         else:
             return self._finish_time - self._start_time
 
-    def _parse_mime_body(self, boundary):
-        if self.body.endswith("\r\n"):
-            footer_length = len(boundary) + 6
-        else:
-            footer_length = len(boundary) + 4
-        parts = self.body[:-footer_length].split("--" + boundary + "\r\n")
-        for part in parts:
-            if not part: continue
-            eoh = part.find("\r\n\r\n")
-            if eoh == -1:
-                logging.warning("multipart/form-data missing headers")
-                continue
-            headers = HTTPHeaders.parse(part[:eoh])
-            name_header = headers.get("Content-Disposition", "")
-            if not name_header.startswith("form-data;") or \
-               not part.endswith("\r\n"):
-                logging.warning("Invalid multipart/form-data")
-                continue
-            value = part[eoh + 4:-2]
-            name_values = {}
-            for name_part in name_header[10:].split(";"):
-                name, name_value = name_part.strip().split("=", 1)
-                name_values[name] = name_value.strip('"').decode("utf-8")
-            if not name_values.get("name"):
-                logging.warning("multipart/form-data value missing name")
-                continue
-            name = name_values["name"]
-            if name_values.get("filename"):
-                ctype = headers.get("Content-Type", "application/unknown")
-                self.files.setdefault(name, []).append(dict(
-                    filename=name_values["filename"], body=value,
-                    content_type=ctype))
-            else:
-                self.arguments.setdefault(name, []).append(value)
-
 
 class WSGIContainer(object):
-    """Makes a WSGI-compatible function runnable on Tornado's HTTP server.
+    r"""Makes a WSGI-compatible function runnable on Tornado's HTTP server.
 
     Wrap a WSGI function in a WSGIContainer and pass it to HTTPServer to
-    run it. For example:
+    run it. For example::
 
         def simple_app(environ, start_response):
             status = "200 OK"
@@ -202,38 +189,54 @@ class WSGIContainer(object):
         tornado.ioloop.IOLoop.instance().start()
 
     This class is intended to let other frameworks (Django, web.py, etc)
-    run on the Tornado HTTP server and I/O loop. It has not yet been
-    thoroughly tested in production.
+    run on the Tornado HTTP server and I/O loop.
+
+    The `tornado.web.FallbackHandler` class is often useful for mixing
+    Tornado and WSGI apps in the same server.  See
+    https://github.com/bdarnell/django-tornado-demo for a complete example.
     """
     def __init__(self, wsgi_application):
         self.wsgi_application = wsgi_application
 
     def __call__(self, request):
         data = {}
-        def start_response(status, response_headers):
+        response = []
+        def start_response(status, response_headers, exc_info=None):
             data["status"] = status
-            data["headers"] = HTTPHeaders(response_headers)
-        body = "".join(self.wsgi_application(
-            self._environ(request), start_response))
+            data["headers"] = response_headers
+            return response.append
+        app_response = self.wsgi_application(
+            WSGIContainer.environ(request), start_response)
+        response.extend(app_response)
+        body = b("").join(response)
+        if hasattr(app_response, "close"):
+            app_response.close()
         if not data: raise Exception("WSGI app did not call start_response")
 
         status_code = int(data["status"].split()[0])
         headers = data["headers"]
+        header_set = set(k.lower() for (k,v) in headers)
         body = escape.utf8(body)
-        headers["Content-Length"] = str(len(body))
-        headers.setdefault("Content-Type", "text/html; charset=UTF-8")
-        headers.setdefault("Server", "TornadoServer/0.1")
+        if "content-length" not in header_set:
+            headers.append(("Content-Length", str(len(body))))
+        if "content-type" not in header_set:
+            headers.append(("Content-Type", "text/html; charset=UTF-8"))
+        if "server" not in header_set:
+            headers.append(("Server", "TornadoServer/%s" % tornado.version))
 
-        parts = ["HTTP/1.1 " + data["status"] + "\r\n"]
-        for key, value in headers.iteritems():
-            parts.append(escape.utf8(key) + ": " + escape.utf8(value) + "\r\n")
-        parts.append("\r\n")
+        parts = [escape.utf8("HTTP/1.1 " + data["status"] + "\r\n")]
+        for key, value in headers:
+            parts.append(escape.utf8(key) + b(": ") + escape.utf8(value) + b("\r\n"))
+        parts.append(b("\r\n"))
         parts.append(body)
-        request.write("".join(parts))
+        request.write(b("").join(parts))
         request.finish()
         self._log(status_code, request)
 
-    def _environ(self, request):
+    @staticmethod
+    def environ(request):
+        """Converts a `tornado.httpserver.HTTPRequest` to a WSGI environment.
+        """
         hostport = request.host.split(":")
         if len(hostport) == 2:
             host = hostport[0]
@@ -244,22 +247,24 @@ class WSGIContainer(object):
         environ = {
             "REQUEST_METHOD": request.method,
             "SCRIPT_NAME": "",
-            "PATH_INFO": request.path,
+            "PATH_INFO": urllib.unquote(request.path),
             "QUERY_STRING": request.query,
+            "REMOTE_ADDR": request.remote_ip,
             "SERVER_NAME": host,
-            "SERVER_PORT": port,
+            "SERVER_PORT": str(port),
+            "SERVER_PROTOCOL": request.version,
             "wsgi.version": (1, 0),
             "wsgi.url_scheme": request.protocol,
-            "wsgi.input": cStringIO.StringIO(request.body),
+            "wsgi.input": BytesIO(escape.utf8(request.body)),
             "wsgi.errors": sys.stderr,
             "wsgi.multithread": False,
             "wsgi.multiprocess": True,
             "wsgi.run_once": False,
         }
         if "Content-Type" in request.headers:
-            environ["CONTENT_TYPE"] = request.headers["Content-Type"]
+            environ["CONTENT_TYPE"] = request.headers.pop("Content-Type")
         if "Content-Length" in request.headers:
-            environ["CONTENT_LENGTH"] = request.headers["Content-Length"]
+            environ["CONTENT_LENGTH"] = request.headers.pop("Content-Length")
         for key, value in request.headers.iteritems():
             environ["HTTP_" + key.replace("-", "_").upper()] = value
         return environ
@@ -275,24 +280,3 @@ class WSGIContainer(object):
         summary = request.method + " " + request.uri + " (" + \
             request.remote_ip + ")"
         log_method("%d %s %.2fms", status_code, summary, request_time)
-
-
-class HTTPHeaders(dict):
-    """A dictionary that maintains Http-Header-Case for all keys."""
-    def __setitem__(self, name, value):
-        dict.__setitem__(self, self._normalize_name(name), value)
-
-    def __getitem__(self, name):
-        return dict.__getitem__(self, self._normalize_name(name))
-
-    def _normalize_name(self, name):
-        return "-".join([w.capitalize() for w in name.split("-")])
-
-    @classmethod
-    def parse(cls, headers_string):
-        headers = cls()
-        for line in headers_string.splitlines():
-            if line:
-                name, value = line.split(": ", 1)
-                headers[name] = value
-        return headers

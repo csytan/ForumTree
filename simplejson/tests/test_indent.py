@@ -2,6 +2,7 @@ from unittest import TestCase
 
 import simplejson as json
 import textwrap
+from StringIO import StringIO
 
 class TestIndent(TestCase):
     def test_indent(self):
@@ -51,3 +52,35 @@ class TestIndent(TestCase):
         #       so the following is expected to fail. Python 2.4 is not a
         #       supported platform in simplejson 2.1.0+.
         self.assertEquals(d2, expect)
+
+    def test_indent0(self):
+        h = {3: 1}
+        def check(indent, expected):
+            d1 = json.dumps(h, indent=indent)
+            self.assertEquals(d1, expected)
+
+            sio = StringIO()
+            json.dump(h, sio, indent=indent)
+            self.assertEquals(sio.getvalue(), expected)
+
+        # indent=0 should emit newlines
+        check(0, '{\n"3": 1\n}')
+        # indent=None is more compact
+        check(None, '{"3": 1}')
+
+    def test_separators(self):
+        lst = [1,2,3,4]
+        expect = '[\n1,\n2,\n3,\n4\n]'
+        expect_spaces = '[\n1, \n2, \n3, \n4\n]'
+        # Ensure that separators still works
+        self.assertEquals(
+            expect_spaces,
+            json.dumps(lst, indent=0, separators=(', ', ': ')))
+        # Force the new defaults
+        self.assertEquals(
+            expect,
+            json.dumps(lst, indent=0, separators=(',', ': ')))
+        # Added in 2.1.4
+        self.assertEquals(
+            expect,
+            json.dumps(lst, indent=0))

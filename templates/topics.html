@@ -1,30 +1,16 @@
 {% extends "base.html" %}
 
 
-{% block style %}
-    <style>
-        .topic {
-            margin-bottom: 15px;
-            padding: 1em;
-        }
-        
-        .topic p {
-            margin-bottom: 0px;
-        }
-    </style>
-{% end %}
-
-
 {% block content %}
     {% for topic in topics %}
-        <div class="topic box">
+        <div class="topic_listing box">
             <h1>
                 <a href="/{{ topic['id'] }}">{{ topic['title'] }}</a>
             </h1>
             <p style="text-align:right">
-                {{ topic['num_comments'] }} comments,
-                <a href="http://www.reddit.com/user/{{ topic['author'] }}">{{ topic['author'] }}</a>,
-                {{ locale.format_date(topic['updated']) }}
+                {{ topic['commentCount'] }} comments,
+                <a href="http://news.ycombinator.com/user?id={{ topic['postedBy'] }}" target="_blank">{{ topic['postedBy'] }}</a>,
+                {{ topic['postedAgo'] }}
             </p>
         </div>
     {% end %}

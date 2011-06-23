@@ -147,7 +147,7 @@ class JSONEncoder(object):
         If encoding is not None, then all input strings will be
         transformed into unicode using that encoding prior to JSON-encoding.
         The default is UTF-8.
-        
+
         If use_decimal is true (not the default), ``decimal.Decimal`` will
         be supported directly by the encoder. For the inverse, decode JSON
         with ``parse_float=decimal.Decimal``.
@@ -165,6 +165,8 @@ class JSONEncoder(object):
         self.indent = indent
         if separators is not None:
             self.item_separator, self.key_separator = separators
+        elif indent is not None:
+            self.item_separator = ','
         if default is not None:
             self.default = default
         self.encoding = encoding
@@ -268,7 +270,7 @@ class JSONEncoder(object):
 
         key_memo = {}
         if (_one_shot and c_make_encoder is not None
-                and not self.indent and not self.sort_keys):
+                and self.indent is None):
             _iterencode = c_make_encoder(
                 markers, self.default, _encoder, self.indent,
                 self.key_separator, self.item_separator, self.sort_keys,

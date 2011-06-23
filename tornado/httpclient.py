@@ -1,38 +1,48 @@
-#!/usr/bin/env python
-#
-# Copyright 2009 Facebook
-#
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
-# not use this file except in compliance with the License. You may obtain
-# a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# License for the specific language governing permissions and limitations
-# under the License.
+"""Blocking and non-blocking HTTP client interfaces.
 
-"""Blocking and non-blocking HTTP client implementations using pycurl."""
+This module defines a common interface shared by two implementations,
+`simple_httpclient` and `curl_httpclient`.  Applications may either
+instantiate their chosen implementation class directly or use the
+`AsyncHTTPClient` class from this module, which selects an implementation
+that can be overridden with the `AsyncHTTPClient.configure` method.
+
+The default implementation is `simple_httpclient`, and this is expected
+to be suitable for most users' needs.  However, some applications may wish
+to switch to `curl_httpclient` for reasons such as the following:
+
+* `curl_httpclient` is more likely to be compatible with sites that are
+  not-quite-compliant with the HTTP spec, or sites that use little-exercised
+  features of HTTP.
+
+* `simple_httpclient` only supports SSL on Python 2.6 and above.
+
+* `curl_httpclient` is faster
+
+* `curl_httpclient` was the default prior to Tornado 2.0.
+
+Note that if you are using `curl_httpclient`, it is highly recommended that
+you use a recent version of ``libcurl`` and ``pycurl``.  Currently the minimum
+supported version is 7.18.2, and the recommended version is 7.21.1 or newer.
+"""
 
 import calendar
-import collections
-import cStringIO
 import email.utils
-import errno
-import functools
 import httplib
-import ioloop
-import logging
-import pycurl
+import os
 import time
+import weakref
 
+from tornado.escape import utf8
+from tornado import httputil
+from tornado.ioloop import IOLoop
+from tornado.util import import_object, bytes_type
 
 class HTTPClient(object):
-    """A blocking HTTP client backed with pycurl.
+    """A blocking HTTP client.
 
-    Typical usage looks like this:
+    This interface is provided for convenience and testing; most applications
+    that are running an IOLoop will want to use `AsyncHTTPClient` instead.
+    Typical usage looks like this::
 
         http_client = httpclient.HTTPClient()
         try:
@@ -40,45 +50,38 @@ class HTTPClient(object):
             print response.body
         except httpclient.HTTPError, e:
             print "Error:", e
-
-    fetch() can take a string URL or an HTTPRequest instance, which offers
-    more options, like executing POST/PUT/DELETE requests.
     """
-    def __init__(self, max_simultaneous_connections=None):
-        self._curl = _curl_create(max_simultaneous_connections)
+    def __init__(self):
+        self._io_loop = IOLoop()
+        self._async_client = AsyncHTTPClient(self._io_loop)
+        self._response = None
 
     def __del__(self):
-        self._curl.close()
+        self._async_client.close()
 
     def fetch(self, request, **kwargs):
-        """Executes an HTTPRequest, returning an HTTPResponse.
+        """Executes a request, returning an `HTTPResponse`.
+        
+        The request may be either a string URL or an `HTTPRequest` object.
+        If it is a string, we construct an `HTTPRequest` using any additional
+        kwargs: ``HTTPRequest(request, **kwargs)``
 
-        If an error occurs during the fetch, we raise an HTTPError.
+        If an error occurs during the fetch, we raise an `HTTPError`.
         """
-        if not isinstance(request, HTTPRequest):
-           request = HTTPRequest(url=request, **kwargs)
-        buffer = cStringIO.StringIO()
-        headers = {}
-        try:
-            _curl_setup_request(self._curl, request, buffer, headers)
-            self._curl.perform()
-            code = self._curl.getinfo(pycurl.HTTP_CODE)
-            if code < 200 or code >= 300:
-                raise HTTPError(code)
-            effective_url = self._curl.getinfo(pycurl.EFFECTIVE_URL)
-            return HTTPResponse(
-                request=request, code=code, headers=headers,
-                body=buffer.getvalue(), effective_url=effective_url)
-        except pycurl.error, e:
-            raise CurlError(*e)
-        finally:
-            buffer.close()
-
+        def callback(response):
+            self._response = response
+            self._io_loop.stop()
+        self._async_client.fetch(request, callback, **kwargs)
+        self._io_loop.start()
+        response = self._response
+        self._response = None
+        response.rethrow()
+        return response
 
 class AsyncHTTPClient(object):
-    """An non-blocking HTTP client backed with pycurl.
+    """An non-blocking HTTP client.
 
-    Example usage:
+    Example usage::
 
         import ioloop
 
@@ -93,213 +96,245 @@ class AsyncHTTPClient(object):
         http_client.fetch("http://www.google.com/", handle_request)
         ioloop.IOLoop.instance().start()
 
-    fetch() can take a string URL or an HTTPRequest instance, which offers
-    more options, like executing POST/PUT/DELETE requests.
-
-    The keyword argument max_clients to the AsyncHTTPClient constructor
-    determines the maximum number of simultaneous fetch() operations that
-    can execute in parallel on each IOLoop.
+    The constructor for this class is magic in several respects:  It actually
+    creates an instance of an implementation-specific subclass, and instances
+    are reused as a kind of pseudo-singleton (one per IOLoop).  The keyword
+    argument force_instance=True can be used to suppress this singleton
+    behavior.  Constructor arguments other than io_loop and force_instance
+    are deprecated.  The implementation subclass as well as arguments to
+    its constructor can be set with the static method configure()
     """
-    _ASYNC_CLIENTS = {}
+    _async_clients = weakref.WeakKeyDictionary()
+    _impl_class = None
+    _impl_kwargs = None
 
-    def __new__(cls, io_loop=None, max_clients=10,
-                max_simultaneous_connections=None):
-        # There is one client per IOLoop since they share curl instances
-        io_loop = io_loop or ioloop.IOLoop.instance()
-        if id(io_loop) in cls._ASYNC_CLIENTS:
-            return cls._ASYNC_CLIENTS[id(io_loop)]
+    def __new__(cls, io_loop=None, max_clients=10, force_instance=False, 
+                **kwargs):
+        io_loop = io_loop or IOLoop.instance()
+        if io_loop in cls._async_clients and not force_instance:
+            return cls._async_clients[io_loop]
         else:
-            instance = super(AsyncHTTPClient, cls).__new__(cls)
-            instance.io_loop = io_loop
-            instance._multi = pycurl.CurlMulti()
-            instance._curls = [_curl_create(max_simultaneous_connections)
-                               for i in xrange(max_clients)]
-            instance._free_list = instance._curls[:]
-            instance._requests = collections.deque()
-            instance._fds = {}
-            instance._events = {}
-            instance._added_perform_callback = False
-            instance._timeout = None
-            cls._ASYNC_CLIENTS[id(io_loop)] = instance
+            if cls is AsyncHTTPClient:
+                if cls._impl_class is None:
+                    from tornado.simple_httpclient import SimpleAsyncHTTPClient
+                    AsyncHTTPClient._impl_class = SimpleAsyncHTTPClient
+                impl = cls._impl_class
+            else:
+                impl = cls
+            instance = super(AsyncHTTPClient, cls).__new__(impl)
+            args = {}
+            if cls._impl_kwargs:
+                args.update(cls._impl_kwargs)
+            args.update(kwargs)
+            instance.initialize(io_loop, max_clients, **args)
+            if not force_instance:
+                cls._async_clients[io_loop] = instance
             return instance
 
+    def close(self):
+        """Destroys this http client, freeing any file descriptors used.
+        Not needed in normal use, but may be helpful in unittests that
+        create and destroy http clients.  No other methods may be called
+        on the AsyncHTTPClient after close().
+        """
+        if self._async_clients[self.io_loop] is self:
+            del self._async_clients[self.io_loop]
+
     def fetch(self, request, callback, **kwargs):
-        """Executes an HTTPRequest, calling callback with an HTTPResponse.
+        """Executes a request, calling callback with an `HTTPResponse`.
+
+        The request may be either a string URL or an `HTTPRequest` object.
+        If it is a string, we construct an `HTTPRequest` using any additional
+        kwargs: ``HTTPRequest(request, **kwargs)``
 
         If an error occurs during the fetch, the HTTPResponse given to the
         callback has a non-None error attribute that contains the exception
-        encountered during the request. You can call response.reraise() to
+        encountered during the request. You can call response.rethrow() to
         throw the exception (if any) in the callback.
         """
-        if not isinstance(request, HTTPRequest):
-           request = HTTPRequest(url=request, **kwargs)
-        self._requests.append((request, callback))
-        self._add_perform_callback()
+        raise NotImplementedError()
 
-    def _add_perform_callback(self):
-        if not self._added_perform_callback:
-            self.io_loop.add_callback(self._perform)
-            self._added_perform_callback = True
+    @staticmethod
+    def configure(impl, **kwargs):
+        """Configures the AsyncHTTPClient subclass to use.
 
-    def _handle_events(self, fd, events):
-        self._events[fd] = events
-        self._add_perform_callback()
+        AsyncHTTPClient() actually creates an instance of a subclass.
+        This method may be called with either a class object or the
+        fully-qualified name of such a class (or None to use the default,
+        SimpleAsyncHTTPClient)
 
-    def _handle_timeout(self):
-        self._timeout = None
-        self._perform()
+        If additional keyword arguments are given, they will be passed
+        to the constructor of each subclass instance created.  The
+        keyword argument max_clients determines the maximum number of
+        simultaneous fetch() operations that can execute in parallel
+        on each IOLoop.  Additional arguments may be supported depending
+        on the implementation class in use.
 
-    def _perform(self):
-        self._added_perform_callback = False
+        Example::
 
-        while True:
-            while True:
-                ret, num_handles = self._multi.perform()
-                if ret != pycurl.E_CALL_MULTI_PERFORM:
-                    break
-
-            # Handle completed fetches
-            completed = 0
-            while True:
-                num_q, ok_list, err_list = self._multi.info_read()
-                for curl in ok_list:
-                    self._finish(curl)
-                    completed += 1
-                for curl, errnum, errmsg in err_list:
-                    self._finish(curl, errnum, errmsg)
-                    completed += 1
-                if num_q == 0:
-                    break
-
-            # Start fetching new URLs
-            started = 0
-            while self._free_list and self._requests:
-                started += 1
-                curl = self._free_list.pop()
-                (request, callback) = self._requests.popleft()
-                curl.info = {
-                    "headers": {},
-                    "buffer": cStringIO.StringIO(),
-                    "request": request,
-                    "callback": callback,
-                    "start_time": time.time(),
-                }
-                _curl_setup_request(curl, request, curl.info["buffer"],
-                                    curl.info["headers"])
-                self._multi.add_handle(curl)
-
-            if not started and not completed:
-                break
-
-        if self._timeout is not None:
-            self.io_loop.remove_timeout(self._timeout)
-            self._timeout = None
-
-        if num_handles:
-            self._timeout = self.io_loop.add_timeout(
-                time.time() + 0.2, self._handle_timeout)
-
-        # Wait for more I/O
-        fds = {}
-        (readable, writable, exceptable) = self._multi.fdset()
-        for fd in readable:
-            fds[fd] = fds.get(fd, 0) | 0x1 | 0x2
-        for fd in writable:
-            fds[fd] = fds.get(fd, 0) | 0x4
-        for fd in exceptable:
-            fds[fd] = fds.get(fd, 0) | 0x8 | 0x10
-
-        for fd in self._fds:
-            if fd not in fds:
-                self.io_loop.remove_handler(fd)
-
-        for fd, events in fds.iteritems():
-            old_events = self._fds.get(fd, None)
-            if old_events is None:
-                self.io_loop.add_handler(fd, self._handle_events, events)
-            elif old_events != events:
-                try:
-                    self.io_loop.update_handler(fd, events)
-                except OSError, e:
-                    if e[0] == errno.ENOENT:
-                        self.io_loop.add_handler(fd, self._handle_events,
-                                                 events)
-                    else:
-                        raise
-        self._fds = fds
-
-    def _finish(self, curl, curl_error=None, curl_message=None):
-        info = curl.info
-        curl.info = None
-        self._multi.remove_handle(curl)
-        self._free_list.append(curl)
-        if curl_error:
-            error = CurlError(curl_error, curl_message)
-            code = error.code
-            body = None
-            effective_url = None
-        else:
-            error = None
-            code = curl.getinfo(pycurl.HTTP_CODE)
-            body = info["buffer"].getvalue()
-            effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
-        info["buffer"].close()
-        info["callback"](HTTPResponse(
-            request=info["request"], code=code, headers=info["headers"],
-            body=body, effective_url=effective_url, error=error,
-            request_time=time.time() - info["start_time"]))
-
+           AsyncHTTPClient.configure("tornado.curl_httpclient.CurlAsyncHTTPClient")
+        """
+        if isinstance(impl, (unicode, bytes_type)):
+            impl = import_object(impl)
+        if impl is not None and not issubclass(impl, AsyncHTTPClient):
+            raise ValueError("Invalid AsyncHTTPClient implementation")
+        AsyncHTTPClient._impl_class = impl
+        AsyncHTTPClient._impl_kwargs = kwargs
 
 class HTTPRequest(object):
-    def __init__(self, url, method="GET", headers={}, body=None,
+    """HTTP client request object."""
+    def __init__(self, url, method="GET", headers=None, body=None,
                  auth_username=None, auth_password=None,
-                 connect_timeout=None, request_timeout=None,
+                 connect_timeout=20.0, request_timeout=20.0,
                  if_modified_since=None, follow_redirects=True,
                  max_redirects=5, user_agent=None, use_gzip=True,
-                 network_interface=None, streaming_callback=None):
+                 network_interface=None, streaming_callback=None,
+                 header_callback=None, prepare_curl_callback=None,
+                 proxy_host=None, proxy_port=None, proxy_username=None,
+                 proxy_password='', allow_nonstandard_methods=False,
+                 validate_cert=True, ca_certs=None,
+                 allow_ipv6=None):
+        """Creates an `HTTPRequest`.
+
+        All parameters except `url` are optional.
+
+        :arg string url: URL to fetch
+        :arg string method: HTTP method, e.g. "GET" or "POST"
+        :arg headers: Additional HTTP headers to pass on the request
+        :type headers: `~tornado.httputil.HTTPHeaders` or `dict`
+        :arg string auth_username: Username for HTTP "Basic" authentication
+        :arg string auth_password: Password for HTTP "Basic" authentication
+        :arg float connect_timeout: Timeout for initial connection in seconds
+        :arg float request_timeout: Timeout for entire request in seconds
+        :arg datetime if_modified_since: Timestamp for ``If-Modified-Since``
+           header
+        :arg bool follow_redirects: Should redirects be followed automatically
+           or return the 3xx response?
+        :arg int max_redirects: Limit for `follow_redirects`
+        :arg string user_agent: String to send as ``User-Agent`` header
+        :arg bool use_gzip: Request gzip encoding from the server
+        :arg string network_interface: Network interface to use for request
+        :arg callable streaming_callback: If set, `streaming_callback` will
+           be run with each chunk of data as it is received, and 
+           `~HTTPResponse.body` and `~HTTPResponse.buffer` will be empty in 
+           the final response.
+        :arg callable header_callback: If set, `header_callback` will
+           be run with each header line as it is received, and 
+           `~HTTPResponse.headers` will be empty in the final response.
+        :arg callable prepare_curl_callback: If set, will be called with
+           a `pycurl.Curl` object to allow the application to make additional
+           `setopt` calls.
+        :arg string proxy_host: HTTP proxy hostname.  To use proxies, 
+           `proxy_host` and `proxy_port` must be set; `proxy_username` and 
+           `proxy_pass` are optional.  Proxies are currently only support 
+           with `curl_httpclient`.
+        :arg int proxy_port: HTTP proxy port
+        :arg string proxy_username: HTTP proxy username
+        :arg string proxy_password: HTTP proxy password
+        :arg bool allow_nonstandard_methods: Allow unknown values for `method` 
+           argument?
+        :arg bool validate_cert: For HTTPS requests, validate the server's
+           certificate?
+        :arg string ca_certs: filename of CA certificates in PEM format,
+           or None to use defaults.  Note that in `curl_httpclient`, if
+           any request uses a custom `ca_certs` file, they all must (they
+           don't have to all use the same `ca_certs`, but it's not possible
+           to mix requests with ca_certs and requests that use the defaults.
+        :arg bool allow_ipv6: Use IPv6 when available?  Default is false in 
+           `simple_httpclient` and true in `curl_httpclient`
+        """
+        if headers is None:
+            headers = httputil.HTTPHeaders()
         if if_modified_since:
             timestamp = calendar.timegm(if_modified_since.utctimetuple())
             headers["If-Modified-Since"] = email.utils.formatdate(
                 timestamp, localtime=False, usegmt=True)
-        if "Pragma" not in headers:
-            headers["Pragma"] = ""
-        self.url = _utf8(url)
+        self.proxy_host = proxy_host
+        self.proxy_port = proxy_port
+        self.proxy_username = proxy_username
+        self.proxy_password = proxy_password
+        self.url = url
         self.method = method
         self.headers = headers
-        self.body = body
-        self.auth_username = _utf8(auth_username)
-        self.auth_password = _utf8(auth_password)
-        self.connect_timeout = connect_timeout or 20.0
-        self.request_timeout = request_timeout or 20.0
+        self.body = utf8(body)
+        self.auth_username = auth_username
+        self.auth_password = auth_password
+        self.connect_timeout = connect_timeout
+        self.request_timeout = request_timeout
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
         self.user_agent = user_agent
         self.use_gzip = use_gzip
         self.network_interface = network_interface
         self.streaming_callback = streaming_callback
+        self.header_callback = header_callback
+        self.prepare_curl_callback = prepare_curl_callback
+        self.allow_nonstandard_methods = allow_nonstandard_methods
+        self.validate_cert = validate_cert
+        self.ca_certs = ca_certs
+        self.allow_ipv6 = allow_ipv6
+        self.start_time = time.time()
 
 
 class HTTPResponse(object):
-    def __init__(self, request, code, headers={}, body="", effective_url=None,
-                 error=None, request_time=None):
+    """HTTP Response object.
+
+    Attributes:
+
+    * request: HTTPRequest object
+
+    * code: numeric HTTP status code, e.g. 200 or 404
+
+    * headers: httputil.HTTPHeaders object
+
+    * buffer: cStringIO object for response body
+
+    * body: respose body as string (created on demand from self.buffer)
+
+    * error: Exception object, if any
+
+    * request_time: seconds from request start to finish
+
+    * time_info: dictionary of diagnostic timing information from the request.
+        Available data are subject to change, but currently uses timings
+        available from http://curl.haxx.se/libcurl/c/curl_easy_getinfo.html,
+        plus 'queue', which is the delay (if any) introduced by waiting for
+        a slot under AsyncHTTPClient's max_clients setting.
+    """
+    def __init__(self, request, code, headers={}, buffer=None,
+                 effective_url=None, error=None, request_time=None,
+                 time_info={}):
         self.request = request
         self.code = code
         self.headers = headers
-        self.body = body
+        self.buffer = buffer
+        self._body = None
         if effective_url is None:
             self.effective_url = request.url
         else:
             self.effective_url = effective_url
         if error is None:
             if self.code < 200 or self.code >= 300:
-                self.error = HTTPError(self.code)
+                self.error = HTTPError(self.code, response=self)
             else:
                 self.error = None
         else:
             self.error = error
         self.request_time = request_time
+        self.time_info = time_info
+
+    def _get_body(self):
+        if self.buffer is None:
+            return None
+        elif self._body is None:
+            self._body = self.buffer.getvalue()
+
+        return self._body
+
+    body = property(_get_body)
 
     def rethrow(self):
+        """If there was an error on the request, raise an `HTTPError`."""
         if self.error:
             raise self.error
 
@@ -309,120 +344,46 @@ class HTTPResponse(object):
 
 
 class HTTPError(Exception):
-    def __init__(self, code, message=None):
+    """Exception thrown for an unsuccessful HTTP request.
+
+    Attributes:
+
+    code - HTTP error integer error code, e.g. 404.  Error code 599 is
+           used when no HTTP response was received, e.g. for a timeout.
+
+    response - HTTPResponse object, if any.
+
+    Note that if follow_redirects is False, redirects become HTTPErrors,
+    and you can look at error.response.headers['Location'] to see the
+    destination of the redirect.
+    """
+    def __init__(self, code, message=None, response=None):
         self.code = code
         message = message or httplib.responses.get(code, "Unknown")
+        self.response = response
         Exception.__init__(self, "HTTP %d: %s" % (self.code, message))
-                
-
-class CurlError(HTTPError):
-    def __init__(self, errno, message):
-        HTTPError.__init__(self, 599, message)
-        self.errno = errno
 
 
-def _curl_create(max_simultaneous_connections=None):
-    curl = pycurl.Curl()
-    if logging.getLogger().isEnabledFor(logging.DEBUG):
-        curl.setopt(pycurl.VERBOSE, 1)
-        curl.setopt(pycurl.DEBUGFUNCTION, _curl_debug)
-    curl.setopt(pycurl.MAXCONNECTS, max_simultaneous_connections or 5)
-    return curl
+def main():
+    from tornado.options import define, options, parse_command_line
+    define("print_headers", type=bool, default=False)
+    define("print_body", type=bool, default=True)
+    define("follow_redirects", type=bool, default=True)
+    args = parse_command_line()
+    client = HTTPClient()
+    for arg in args:
+        try:
+            response = client.fetch(arg,
+                                    follow_redirects=options.follow_redirects)
+        except HTTPError, e:
+            if e.response is not None:
+                response = e.response
+            else:
+                raise
+        if options.print_headers:
+            print response.headers
+        if options.print_body:
+            print response.body
 
-
-def _curl_setup_request(curl, request, buffer, headers):
-    curl.setopt(pycurl.URL, request.url)
-    curl.setopt(pycurl.HTTPHEADER,
-                ["%s: %s" % i for i in request.headers.iteritems()])
-    try:
-        curl.setopt(pycurl.HEADERFUNCTION,
-                    functools.partial(_curl_header_callback, headers))
-    except:
-        # Old version of curl; response will not include headers
-        pass
-    if request.streaming_callback:
-        curl.setopt(pycurl.WRITEFUNCTION, request.streaming_callback)
-    else:
-        curl.setopt(pycurl.WRITEFUNCTION, buffer.write)
-    curl.setopt(pycurl.FOLLOWLOCATION, request.follow_redirects)
-    curl.setopt(pycurl.MAXREDIRS, request.max_redirects)
-    curl.setopt(pycurl.CONNECTTIMEOUT, int(request.connect_timeout))
-    curl.setopt(pycurl.TIMEOUT, int(request.request_timeout))
-    if request.user_agent:
-        curl.setopt(pycurl.USERAGENT, request.user_agent)
-    else:
-        curl.setopt(pycurl.USERAGENT, "Mozilla/5.0 (compatible; pycurl)")
-    if request.network_interface:
-        curl.setopt(pycurl.INTERFACE, request.network_interface)
-    if request.use_gzip:
-        curl.setopt(pycurl.ENCODING, "gzip,deflate")
-    else:
-        curl.setopt(pycurl.ENCODING, "none")
-
-    # Set the request method through curl's retarded interface which makes
-    # up names for every single method
-    curl_options = {
-        "GET": pycurl.HTTPGET,
-        "POST": pycurl.POST,
-        "PUT": pycurl.UPLOAD,
-        "HEAD": pycurl.NOBODY,
-    }
-    for o in curl_options.values():
-        curl.setopt(o, False)
-    curl.setopt(curl_options[request.method], True)
-
-    # Handle curl's cryptic options for every individual HTTP method
-    if request.method in ("POST", "PUT"):
-        request_buffer =  cStringIO.StringIO(request.body)
-        curl.setopt(pycurl.READFUNCTION, request_buffer.read)
-        if request.method == "POST":
-            def ioctl(cmd):
-                if cmd == curl.IOCMD_RESTARTREAD:
-                    request_buffer.seek(0)
-            curl.setopt(pycurl.IOCTLFUNCTION, ioctl)
-            curl.setopt(pycurl.POSTFIELDSIZE, len(request.body))
-        else:
-            curl.setopt(pycurl.INFILESIZE, len(request.body))
-
-    if request.auth_username and request.auth_password:
-        userpwd = "%s:%s" % (request.auth_username, request.auth_password)
-        curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
-        curl.setopt(pycurl.USERPWD, userpwd)
-        logging.info("%s %s (username: %r)", request.method, request.url,
-                     request.auth_username)
-    else:
-        curl.unsetopt(pycurl.USERPWD)
-        logging.info("%s %s", request.method, request.url)
-
-
-def _curl_header_callback(headers, header_line):
-    if header_line.startswith("HTTP/"):
-        headers.clear()
-        return
-    if header_line == "\r\n":
-        return
-    parts = header_line.split(": ")
-    if len(parts) != 2:
-        logging.warning("Invalid HTTP response header line %r", header_line)
-        return
-    headers[parts[0].strip()] = parts[1].strip()
-
-
-def _curl_debug(debug_type, debug_msg):
-    debug_types = ('I', '<', '>', '<', '>')
-    if debug_type == 0:
-        logging.debug('%s', debug_msg.strip())
-    elif debug_type in (1, 2):
-        for line in debug_msg.splitlines():
-            logging.debug('%s %s', debug_types[debug_type], line)
-    elif debug_type == 4:
-        logging.debug('%s %r', debug_types[debug_type], debug_msg)
-
-
-def _utf8(value):
-    if value is None:
-        return value
-    if isinstance(value, unicode):
-        return value.encode("utf-8")
-    assert isinstance(value, str)
-    return value
+if __name__ == "__main__":
+    main()
