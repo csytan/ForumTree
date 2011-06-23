@@ -1,10 +1,11 @@
 import re
 import logging
-import urllib
 import os
 import wsgiref.handlers
 
 from google.appengine.api import memcache
+from google.appengine.api import urlfetch
+
 import simplejson as json
 
 import tornado.wsgi
@@ -17,13 +18,13 @@ class Topics(tornado.web.RequestHandler):
         topics = memcache.get('topics')
         if topics is None:
             try:
-                response = urllib.urlopen('http://api.ihackernews.com/page').read()
-                data = json.loads(response)
+                response = urlfetch.fetch('http://api.ihackernews.com/page', deadline=10)
+                data = json.loads(response.content)
             except Exception, e:
                 logging.error(e)
                 return self.render('error.html')
             topics = data['items']
-            memcache.add('topics', topics, 10)
+            memcache.add('topics', topics)
         self.render('topics.html', topics=topics)
 
 
@@ -36,13 +37,13 @@ class Topic(tornado.web.RequestHandler):
             except Exception, e:
                 logging.error(e)
                 return self.render('error.html')
-            memcache.add('topic:' + id, topic, 10)
+            memcache.add('topic:' + id, topic)
         self.render('topic.html', topic=topic)
         
     @staticmethod
     def fetch_topic(id):
-        response = urllib.urlopen('http://api.ihackernews.com/post/' + id).read()
-        topic = json.loads(response)
+        response = urlfetch.fetch('http://api.ihackernews.com/post/' + id, deadline=10)
+        topic = json.loads(response.content)
         topic['graph'] = {}
         topic['all_comments'] = []
         
