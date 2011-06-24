@@ -11,7 +11,7 @@
 </head>
 
 <body>
-    <a href="http://github.com/csytan/forumtree"><img style="position: absolute; top: 0; right: 0; border: 0;" src="http://s3.amazonaws.com/github/ribbons/forkme_right_gray_6d6d6d.png" alt="Fork me on GitHub"></a>
+    <a href="http://github.com/csytan/forumtree"><img style="position: absolute; top: 0; right: 0; border: 0; z-index:10" src="http://s3.amazonaws.com/github/ribbons/forkme_right_gray_6d6d6d.png" alt="Fork me on GitHub"></a>
     <div id="header">
         <a href="/" id="logo">forumtree</a>
         <br>
@@ -26,14 +26,15 @@
     </div>
     <div id="footer">
         <script type="text/javascript">
-        var gaJsHost = (("https:" == document.location.protocol) ? "https://ssl." : "http://www.");
-        document.write(unescape("%3Cscript src='" + gaJsHost + "google-analytics.com/ga.js' type='text/javascript'%3E%3C/script%3E"));
+          var _gaq = _gaq || [];
+          _gaq.push(['_setAccount', 'UA-24168189-1']);
+          _gaq.push(['_trackPageview']);
+          (function() {
+            var ga = document.createElement('script'); ga.type = 'text/javascript'; ga.async = true;
+            ga.src = ('https:' == document.location.protocol ? 'https://ssl' : 'http://www') + '.google-analytics.com/ga.js';
+            var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(ga, s);
+          })();
         </script>
-        <script type="text/javascript">
-        try {
-        var pageTracker = _gat._getTracker("UA-3228291-1");
-        pageTracker._trackPageview();
-        } catch(err) {}</script>
     </div>
 </body>
 
