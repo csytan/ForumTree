@@ -1,11 +1,6 @@
 {% extends "base.html" %}
 
 
-{% block title %}
-    <title>forumtree | {{ topic['title'] }}</title>
-{% end %}
-
-
 {% block style %}
     <style>
         #content {
@@ -27,7 +22,7 @@
             .find('.comment')
             .addClass('topic')
             .end()
-            .initTopic({{ topic['graph'] }});
+            .initTopic({% raw graph %});
         });
     </script>
 {% end %}
